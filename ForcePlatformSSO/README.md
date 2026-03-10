@@ -42,7 +42,7 @@ Adapted from the original `ForcePlatformSSO.sh` (Microsoft Entra ID) by Scott Ke
 4. Retrieves the Jamf static group ID and device ID via the Jamf Pro API.
 5. Adds the device to the Platform SSO static group, which triggers delivery of the `extensiblesso` MDM configuration profile.
 6. If the profile is already installed, the device is removed then re-added to force the registration prompt to reappear.
-7. Enables the Okta Verify SSO extension (`com.okta.mobile.app.ssoextension`) via `pluginkit` if not already active.
+7. Enables the Okta Verify SSO extension (`com.okta.mobile.auth-service-extension`) via `pluginkit` if not already active.
 8. Checks current registration status via `app-sso platform -s`. If already registered, exits cleanly.
 9. Displays a SwiftDialog prompt to the user explaining what to do when the macOS registration notification appears.
 10. Kills and restarts the Platform SSO agent (`AppSSOAgent`) to force the registration prompt.
@@ -87,10 +87,10 @@ Create a **Configuration Profile** scoped to the static group above. The profile
 
 | Field | Value |
 |---|---|
-| Extension Identifier | `com.okta.mobile.app.ssoextension` |
+| Extension Identifier | `com.okta.mobile.auth-service-extension` |
 | Team Identifier | `B7F62B65BN` |
 | Type | Redirect |
-| URLs | Your Okta org URL, e.g. `https://yourorg.okta.com` |
+| URLs | `https://intenthq.okta.com`, `https://intenthq.okta.com/device-access/api/v1/nonce`, `https://intenthq.okta.com/oauth2/v1/token` |
 
 Refer to [Okta's macOS Platform SSO documentation](https://help.okta.com/en-us/content/topics/mobile/apple-platform-sso.htm) for full payload configuration options.
 
@@ -230,20 +230,20 @@ Key fields to look for in the output:
 
 - `registrationCompleted : true` - device is registered
 - `loginFrequency` - how often re-authentication is required
-- `extensionIdentifier` - should show `com.okta.mobile.app.ssoextension`
+- `extensionIdentifier` - should show `com.okta.mobile.auth-service-extension`
 
 ---
 
 **Checking the SSO extension is enabled**
 
 ```zsh
-pluginkit -m | grep okta
+pluginkit -m | grep okta.mobile.auth-service-extension
 ```
 
 A `+` prefix indicates the extension is enabled. A `-` prefix means it is disabled - the script will enable it automatically, but you can do so manually with:
 
 ```zsh
-pluginkit -e use -i com.okta.mobile.app.ssoextension
+pluginkit -e use -i com.okta.mobile.auth-service-extension
 ```
 
 ---
@@ -252,4 +252,5 @@ pluginkit -e use -i com.okta.mobile.app.ssoextension
 
 | Version | Date | Notes |
 |---|---|---|
+| 1.1 | 2026-03-10 | Corrected `APP_EXTENSIONS` bundle ID from `com.okta.mobile.app.ssoextension` to `com.okta.mobile.auth-service-extension` to match the actual Platform SSO extension identifier used in the Jamf configuration profile. Updated all README references and diagnostic commands accordingly. Added base org URL to recommended extensiblesso URL list. |
 | 1.0 | 2026-03-10 | Initial Okta adaptation from ForcePlatformSSO.sh v2.0 (Entra ID). Replaced Company Portal with Okta Verify, removed jamfAAD dependency, replaced JAMF_check_AAD with JAMF_check_Okta using native app-sso, updated app extensions array, updated all display strings. |
