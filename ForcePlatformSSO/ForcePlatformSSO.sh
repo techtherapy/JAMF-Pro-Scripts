@@ -37,7 +37,7 @@
 #
 # 1.0 - Initial Okta adaptation from ForcePlatformSSO.sh v2.0 (Entra ID)
 #       - Replaced Company Portal with Okta Verify
-#       - Replaced all com.microsoft.* app extensions with com.okta.mobile.app.ssoextension
+#       - Replaced all com.microsoft.* app extensions with com.okta.mobile.auth-service-extension
 #       - Removed jamfAAD binary dependency entirely
 #       - Replaced JAMF_check_AAD with JAMF_check_Okta using native app-sso command
 #       - Replaced RUN_JAMF_AAD_ON_ERROR with RUN_OKTA_ON_ERROR; remediation now
@@ -45,6 +45,9 @@
 #       - Updated all display strings to reference Okta instead of Microsoft Entra ID
 #       - Retained all JAMF API functions, SwiftDialog framework, TouchID logic,
 #         Focus mode detection, and group add/remove logic unchanged
+# 1.1 - Corrected APP_EXTENSIONS bundle ID from com.okta.mobile.app.ssoextension
+#         to com.okta.mobile.auth-service-extension to match the actual Platform SSO
+#         extension identifier present in the Jamf extensiblesso configuration profile
 
 ######################################################################################################
 #
@@ -127,7 +130,7 @@ SD_TIMER=300    # Length of time you want the message on the screen (300 = 5 min
 # The Microsoft CompanyPortalMac extensions from the original script have
 # been replaced with the single Okta Verify SSO extension.
 # --------------------------------------------------------------------------
-APP_EXTENSIONS=("com.okta.mobile.app.ssoextension")
+APP_EXTENSIONS=("com.okta.mobile.auth-service-extension")
 
 # JAMF policy triggers - update these to match your JAMF policy trigger names
 SUPPORT_FILE_INSTALL_POLICY="install_SymFiles"
