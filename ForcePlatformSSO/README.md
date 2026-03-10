@@ -1,75 +1,255 @@
-## Force Platform SSO Prompt
+# ForcePlatformSSO_Okta.sh
 
-This script is designed to force the prompt for Platform SSO on the users desktop. It does this by: 
+A Jamf Pro script that deploys and enforces **Platform Single Sign-on (PSSO) via Okta Verify** on managed macOS devices. It handles the full registration lifecycle: installing Okta Verify, adding the device to the correct Jamf static group to trigger the SSO configuration profile, prompting the user to complete registration, and verifying the outcome.
 
-* Determining if the Platform SSO profile is installed on their Mac
-* Removing the user out of the MDM profile group for the Platform SSO (if necessary)
-* Re-adding the user to the same Platform SSO group again
-  
- The script is focus mode aware and can display the apropriate message accordingly.
+Adapted from the original `ForcePlatformSSO.sh` (Microsoft Entra ID) by Scott Kendall.
 
-_This is designed to use JAMF static groups for Configuration Profile deployment_
+---
 
-It should force the pSSO register prompt to reappear.  Once the prompt reappears, it will display a nicely formatted Swift Dialog prompt informing the user what to do.
+## Table of Contents
 
-Script was inspired by the work done by Howie Canterbury.
+- [Requirements](#requirements)
+- [How It Works](#how-it-works)
+- [Prerequisites](#prerequisites)
+  - [Jamf Pro Setup](#jamf-pro-setup)
+  - [Okta Admin Setup](#okta-admin-setup)
+  - [Support Files](#support-files)
+- [Script Parameters](#script-parameters)
+- [Deployment](#deployment)
+- [Customisation](#customisation)
+- [Troubleshooting](#troubleshooting)
+- [Change Log](#change-log)
 
+---
 
-![](./ForcePlatformSSO.png)
+## Requirements
 
-If the user has focus mode turned on, they will get a slightly different message
+| Component | Minimum version |
+|---|---|
+| macOS | 13 Ventura |
+| Jamf Pro | 10.49 or later |
+| SwiftDialog | 2.5.0 or later |
+| Okta Verify | Latest available via your Jamf policy |
+| Shell | zsh (built-in on macOS 10.15+) |
 
-![](./ForcePlatformSSO-Focus.png)
+---
 
-During the registration of pSSO into Entra, the user will be asked to verify that the Company Portal extension is enabled in the Autofill & Password section of System Settings - This script will auto-enable that feature in case the user doesn't.
+## How It Works
 
-![](ForcePlatformSSO-Extensions.png)
+1. Verifies SwiftDialog is installed and up to date; installs it via Jamf if not.
+2. Checks that required support files and icons are present; pulls them from Jamf if not.
+3. Optionally enforces TouchID enrollment before proceeding.
+4. Retrieves the Jamf static group ID and device ID via the Jamf Pro API.
+5. Adds the device to the Platform SSO static group, which triggers delivery of the `extensiblesso` MDM configuration profile.
+6. If the profile is already installed, the device is removed then re-added to force the registration prompt to reappear.
+7. Enables the Okta Verify SSO extension (`com.okta.mobile.app.ssoextension`) via `pluginkit` if not already active.
+8. Checks current registration status via `app-sso platform -s`. If already registered, exits cleanly.
+9. Displays a SwiftDialog prompt to the user explaining what to do when the macOS registration notification appears.
+10. Kills and restarts the Platform SSO agent (`AppSSOAgent`) to force the registration prompt.
+11. Polls every 10 seconds (up to 5 minutes) until registration is confirmed.
+12. Verifies the final registration state via `app-sso platform -s`. If it still does not report as registered and `RUN_OKTA_ON_ERROR` is set to `yes`, re-triggers the Okta Verify Jamf install policy as a remediation step.
 
-## Setup / Configuration ##
+---
 
-If you are using the Modern JAMF API credentials, you need to set:
+## Prerequisites
 
-    Update Static Computer Groups
-    Read Computers
-    Read Static Groups
+### Jamf Pro Setup
 
-To configure this script, you will need the following:
+#### 1. API Role and Client
 
-1.  Your JAMF credentials (Classic or Modern API)
-2.  The Config Profile (name) of your Platform SSO extension.  I scope this to users that are part of a static group
-3.  The Static Group (name) that you add users to, which installs the pSSO Config Profile
-4.  Optional -  Attempt to fix the JAMF registration if `jamfAAD gatherAADInfo` command shows that the device is not registered.
-5.  Optional - You can force the TouchID registration on system that have it available.
-   
-![](./ForcePlatformSSO-Settings.png)
+Create a dedicated API role with the following minimum privileges:
 
-Once you configure these variables inside of your policy, you can scope this policy to your users.
+- **Computers** - Read
+- **Computer Groups** - Read, Update
+- **Static Computer Groups** - Read, Update
 
-![Scoping of Config Profile](ForcePlatformSSO-Scoping.png)
+Then create an API client using that role and note the **Client ID** and **Client Secret**. If you are using Classic API credentials (username/password), these map to the same parameters - the script detects which type to use based on the length of the Client ID.
 
-## Release Notes ##
+#### 2. Policies
 
-| **Version**|**Notes**|
-|:--------:|-----|
-| 1.0 | Initial
-| 1.1 | Made MDM profile and JAMF group name passed in variables vs hard coded
-||      Make sure that all exit processes go thru the cleanup_and_exit function
-||      Made the psso command run as current user (Thanks Adam N)
-||      Perform a gatherAADInfo command after successful registration
-| 1.2 | Put in the --silent flag for the curl commands to not clutter the log
-||      changed logic in the detection of SS+...it was not returning expected value
-||      Change the gatherAADInfo to RunAsUser vs root
-| 1.3 | removed the app-sso -l command...wasn't really needed 
-| 1.4 | Added feature to check for focus status and change the alert message accordingly
-| 1.5 | Used modern JAMF API wherever possible
-||      More logging of events
-||      More error trapping of failures
-||      Reworked Common section to be more inline with the rest of my apps
-||      Fixed Typos
-| 1.6 | Added option to check for valid "jamfAAD gatherAADInfo" and attempt to fix if not registered properly
-||       Also added parameter to force gatherAADInfo to run if failure detected
-||       Fixed issue of runAsUsers not using correct USER_UID variable
-| 1.7 | Added option to force a touchID fingerprint if not already set
-||       More reporting for focus status & touchID status
-| 1.8 | Add section to enable the microsoft Autofill extension automatically
-| 1.9 | Reworked logic to detect the presence of TouchID better
+The script expects the following Jamf policy **trigger names** to exist. You can change these names in the variable block at the top of the script if needed.
+
+| Variable | Default trigger name | Purpose |
+|---|---|---|
+| `PORTAL_APP_POLICY` | `install_okta_verify` | Installs or reinstalls Okta Verify |
+| `DIALOG_INSTALL_POLICY` | `install_SwiftDialog` | Installs SwiftDialog |
+| `SUPPORT_FILE_INSTALL_POLICY` | `install_SymFiles` | Installs banner image and support files |
+| `PSSO_ICON_POLICY` | `install_psso_icon` | Installs the SSO icon used in dialogs |
+| `SSO_GRAPHIC_POLICY` | `install_sso_graphic` | Installs the notification graphic |
+
+#### 3. Static Group
+
+Create a **Static Computer Group** in Jamf Pro. This is the group that devices are added to in order to receive the Platform SSO configuration profile via a scoped policy or configuration profile. Note the exact group name - it is passed in as a script parameter.
+
+#### 4. Configuration Profile
+
+Create a **Configuration Profile** scoped to the static group above. The profile must contain a **Single Sign-On Extensions** (`com.apple.extensiblesso`) payload configured as follows:
+
+| Field | Value |
+|---|---|
+| Extension Identifier | `com.okta.mobile.app.ssoextension` |
+| Team Identifier | `B7F62B65BN` |
+| Type | Redirect |
+| URLs | Your Okta org URL, e.g. `https://yourorg.okta.com` |
+
+Refer to [Okta's macOS Platform SSO documentation](https://help.okta.com/en-us/content/topics/mobile/apple-platform-sso.htm) for full payload configuration options.
+
+Note the **exact profile name** as it appears in Jamf - this is passed in as a script parameter.
+
+---
+
+### Okta Admin Setup
+
+1. In the Okta Admin Console, navigate to **Security > Device Integrations > Platform Single Sign-on**.
+2. Enable **macOS Platform SSO**.
+3. Set the authentication method to match your org's requirements (Password, Secure Enclave key, or Smart Card).
+4. Ensure Okta Verify is configured as a managed app in your Jamf/MDM integration.
+
+Okta's official setup guide: [Configure macOS Platform SSO](https://help.okta.com/en-us/content/topics/mobile/apple-platform-sso.htm)
+
+---
+
+### Support Files
+
+The script expects the following files to be present on disk. If they are missing, it will attempt to install them via the corresponding Jamf policies listed above.
+
+| File | Default path |
+|---|---|
+| Banner image | `/Library/Application Support/GiantEagle/SupportFiles/GE_SD_BannerImage.png` |
+| SSO icon | `/Library/Application Support/GiantEagle/SupportFiles/sso.png` |
+| Notification graphic | `/Library/Application Support/GiantEagle/SupportFiles/pSSO_Notification.png` |
+
+These paths can be overridden by deploying a managed preferences file at:
+
+```
+/Library/Managed Preferences/com.gianteaglescript.defaults.plist
+```
+
+With keys: `SupportFiles` (base path), `BannerImage` (relative path), `BannerPadding` (integer).
+
+---
+
+## Script Parameters
+
+Configure these in the Jamf policy under **Scripts > Parameters**.
+
+| Parameter | Label | Required | Description |
+|---|---|---|---|
+| `$4` | API Client ID | Yes | Jamf API Client ID (modern OAuth) or username (Classic API). The script determines which type to use based on string length. |
+| `$5` | API Client Secret | Yes | Jamf API Client Secret or password. |
+| `$6` | MDM Profile Name | Yes | Exact name of the Platform SSO configuration profile in Jamf. Must match precisely. |
+| `$7` | Jamf Static Group Name | Yes | Exact name of the static group that scopes the SSO profile. |
+| `$8` | Run Okta remediation on error | No | `yes` or `no`. If registration is not confirmed after completion, re-triggers the Okta Verify install policy. Defaults to `yes`. |
+| `$9` | Force TouchID enrollment | No | `yes` or `no`. If TouchID hardware is present but no fingerprints are enrolled, the user is prompted to add one before registration proceeds. Defaults to `yes`. |
+
+---
+
+## Deployment
+
+1. Upload `ForcePlatformSSO_Okta.sh` to **Jamf Pro > Settings > Computer Management > Scripts**.
+2. Set the script's **Parameter Labels** to match the table above (for clarity in the policy UI).
+3. Create a new **Policy** in Jamf Pro:
+   - **Trigger:** Recurring Check-in, or a custom event trigger if you prefer to call it manually.
+   - **Frequency:** Once per computer (or Once per user per computer if you need per-user enforcement).
+   - **Scope:** Target the computers or groups that need PSSO deployed.
+   - **Scripts:** Add `ForcePlatformSSO_Okta.sh` and fill in Parameters 4-9.
+4. **Test on a single device** before broad deployment - see the Troubleshooting section below.
+
+---
+
+## Customisation
+
+**Changing support file paths**
+Deploy a `com.gianteaglescript.defaults.plist` managed preferences file via Jamf to override default paths without editing the script.
+
+**Forcing Okta Verify reinstall**
+Uncomment this line in the Main section of the script:
+
+```zsh
+#reinstall_okta_verify
+```
+
+This will remove the existing Okta Verify installation and reinstall it fresh before proceeding. Useful if you suspect a corrupted install is causing registration failures.
+
+**Adjusting the registration timeout**
+Change `max_wait` in the polling loop (default: 300 seconds):
+
+```zsh
+max_wait=300    # total seconds before timeout
+```
+
+**Adjusting the dialog display duration**
+Change `SD_TIMER` (default: 300 seconds):
+
+```zsh
+SD_TIMER=300
+```
+
+---
+
+## Troubleshooting
+
+**Log file location**
+
+```
+/Library/Application Support/GiantEagle/logs/ForcePlatformSSO_Okta.log
+```
+
+Tail the log in real time during testing:
+
+```zsh
+tail -f "/Library/Application Support/GiantEagle/logs/ForcePlatformSSO_Okta.log"
+```
+
+---
+
+**Common issues**
+
+| Symptom | Likely cause | Resolution |
+|---|---|---|
+| Script exits with "Missing Group name or MDM profile name" | Parameters 6 or 7 are blank in the Jamf policy | Check the script parameters in the Jamf policy configuration |
+| "JSS connection not active" | Device cannot reach Jamf Pro | Check network connectivity and Jamf Pro server availability |
+| "Check the API Client credentials" | Incorrect Client ID or Secret in parameters 4/5 | Verify API client credentials in Jamf Pro and re-enter in the policy |
+| "Group ID came back empty" | Static group name in parameter 7 does not match exactly | Copy the group name directly from Jamf Pro; check for trailing spaces |
+| Registration prompt never appears | Configuration profile not delivered, or SSO agent did not restart | Verify profile scope in Jamf, check that Okta Verify is installed, run `app-sso platform -s` as the user to inspect state |
+| "Timed out after 300s" | User did not complete registration within 5 minutes, or prompt was not seen | Check Focus mode status in the log; increase `max_wait` if needed; verify the Okta registration prompt appeared |
+| Extension not found in pluginkit | Okta Verify is not installed or is an incompatible version | Confirm Okta Verify installs successfully via the `install_okta_verify` policy trigger |
+| TouchID loop does not exit | `touch_id_status` comparison mismatch | The function returns `"Enabled"` (capital E) - verify no local modifications changed the case |
+
+---
+
+**Manually checking Platform SSO status**
+
+Run the following as the logged-in user to inspect current registration state:
+
+```zsh
+app-sso platform -s
+```
+
+Key fields to look for in the output:
+
+- `registrationCompleted : true` - device is registered
+- `loginFrequency` - how often re-authentication is required
+- `extensionIdentifier` - should show `com.okta.mobile.app.ssoextension`
+
+---
+
+**Checking the SSO extension is enabled**
+
+```zsh
+pluginkit -m | grep okta
+```
+
+A `+` prefix indicates the extension is enabled. A `-` prefix means it is disabled - the script will enable it automatically, but you can do so manually with:
+
+```zsh
+pluginkit -e use -i com.okta.mobile.app.ssoextension
+```
+
+---
+
+## Change Log
+
+| Version | Date | Notes |
+|---|---|---|
+| 1.0 | 2026-03-10 | Initial Okta adaptation from ForcePlatformSSO.sh v2.0 (Entra ID). Replaced Company Portal with Okta Verify, removed jamfAAD dependency, replaced JAMF_check_AAD with JAMF_check_Okta using native app-sso, updated app extensions array, updated all display strings. |
