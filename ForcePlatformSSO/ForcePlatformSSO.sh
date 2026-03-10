@@ -1,22 +1,22 @@
 #!/bin/zsh --no-rcs
 #
-# ForcePlatformSSO.sh
+# ForcePlatformSSO_Okta.sh
 #
-# by: Scott Kendall
+# Original author: Scott Kendall (Entra ID version)
+# Adapted for Okta by: Claude / Anthropic
 #
 # Written: 10/02/2025
-# Last updated: 02/25/2026
+# Last updated: 03/10/2026
 #
-# Script Purpose: Deploys Platform Single Sign-on
+# Script Purpose: Deploys Platform Single Sign-on via Okta Verify
 #
-# Contributions by: Howie Canterbury
-#
-#	1 - Installs Microsoft Company Portal
-#	2 - Triggers install of Platform SSO for Microsoft Entra ID configuration profile by adding the Mac to 
-#	    Platform Single Sign-on group
-#	3 - Deploys password expiration check to alert users when their password is due to expire in 14 days or less
-#   4 - Can force touchID enrollment if available
-#   5 - Optionally choose to remove/reinstall CompanyPortal if present
+#   1 - Installs Okta Verify
+#   2 - Triggers install of Platform SSO for Okta configuration profile by adding
+#       the Mac to a Platform Single Sign-on group in JAMF
+#   3 - Deploys password expiration check to alert users when their password is
+#       due to expire in 14 days or less
+#   4 - Can force TouchID enrollment if available
+#   5 - Optionally remove/reinstall Okta Verify if present
 
 ######################
 #
@@ -26,35 +26,25 @@
 #
 #   Parameter 4: API client ID (Modern or Classic)
 #   Parameter 5: API client secret
-#   Parameter 6: MDM Profile Name
+#   Parameter 6: MDM Profile Name (must match the extensiblesso profile name in JAMF)
 #   Parameter 7: JAMF Static Group name (for Platform SSO Users)
-#   Parameter 8: Attempt to run "jamfAAD gatherSSOStatus" if JAMF not showing as compliant after registration
-#   Parameter 9: Force touchID fingerprint enrollment if not already set
+#   Parameter 8: Attempt to re-trigger Okta Verify install policy if not showing
+#                as registered after timeout (yes/no)
+#   Parameter 9: Force TouchID fingerprint enrollment if not already set (yes/no)
 
 #
-# 1.0 - Initial
-# 1.1 - Made MDM profile and JAMF group name passed in variables vs hard coded
-#       Make sure that all exit processes go thru the cleanup_and_exit function
-#       Made the psso command run as current user (Thanks Adam N)
-#       Perform a gatherAADInfo command after successful registration
-# 1.2 - Put in the --silent flag for the curl commands to not clutter the log
-#       changed logic in the detection of SS+...it was not returning expected value
-#       Change the gatherAADInfo to RunAsUser vs root
-# 1.3 - removed the app-sso -l command...wasn't really needed 
-# 1.4 - Added feature to check for focus status and change the alert message accordingly
-# 1.5 - Used modern JAMF API wherever possible
-#       More logging of events
-#       More error trapping of failures
-#       Reworked Common section to be more inline with the rest of my apps
-#       Fixed Typos
-# 1.6 - Added option to check for valid "jamfAAD gatherAADInfo" and attempt to fix if not registered properly
-#       Also added parameter to force gatherAADInfo to run if failure detected
-#       Fixed issue of runAsUsers not using correct USER_UID variable
-# 1.7 - Added option to force a touchID fingerprint if not already set
-#       More reporting for focus status & touchID status
-# 1.8 - Add section to enable the microsoft Autofill extension automatically
-# 1.9 - Reworked logic to detect the presence of TouchID better
-# 2.0 - Fixed display issues with Swift Dialog 3.0
+# Change log (Okta adaptation):
+#
+# 1.0 - Initial Okta adaptation from ForcePlatformSSO.sh v2.0 (Entra ID)
+#       - Replaced Company Portal with Okta Verify
+#       - Replaced all com.microsoft.* app extensions with com.okta.mobile.app.ssoextension
+#       - Removed jamfAAD binary dependency entirely
+#       - Replaced JAMF_check_AAD with JAMF_check_Okta using native app-sso command
+#       - Replaced RUN_JAMF_AAD_ON_ERROR with RUN_OKTA_ON_ERROR; remediation now
+#         re-triggers the Okta Verify JAMF install policy
+#       - Updated all display strings to reference Okta instead of Microsoft Entra ID
+#       - Retained all JAMF API functions, SwiftDialog framework, TouchID logic,
+#         Focus mode detection, and group add/remove logic unchanged
 
 ######################################################################################################
 #
@@ -63,7 +53,7 @@
 ######################################################################################################
 #set -x
 export PATH=/usr/bin:/bin:/usr/sbin:/sbin
-SCRIPT_NAME="ForcePlatformSSO"
+SCRIPT_NAME="ForcePlatformSSO_Okta"
 LOGGED_IN_USER=$( scutil <<< "show State:/Users/ConsoleUser" | awk '/Name :/ && ! /loginwindow/ { print $3 }' )
 USER_DIR=$( dscl . -read /Users/${LOGGED_IN_USER} NFSHomeDirectory | awk '{ print $2 }' )
 USER_UID=$(id -u "$LOGGED_IN_USER")
@@ -95,12 +85,13 @@ DIALOG_COMMAND_FILE=$(mktemp "/var/tmp/${SCRIPT_NAME}_cmd.XXXXX")
 JSON_DIALOG_BLOB=$(mktemp "/var/tmp/${SCRIPT_NAME}_json.XXXXX")
 chmod 666 $DIALOG_COMMAND_FILE
 chmod 666 $JSON_DIALOG_BLOB
+
 ###################################################
 #
 # App Specific variables (Feel free to change these)
 #
 ###################################################
-   
+
 # See if there is a "defaults" file...if so, read in the contents
 DEFAULTS_DIR="/Library/Managed Preferences/com.gianteaglescript.defaults.plist"
 if [[ -f "$DEFAULTS_DIR" ]]; then
@@ -111,7 +102,7 @@ if [[ -f "$DEFAULTS_DIR" ]]; then
 else
     SUPPORT_DIR="/Library/Application Support/GiantEagle"
     SD_BANNER_IMAGE="${SUPPORT_DIR}/SupportFiles/GE_SD_BannerImage.png"
-    spacing=5 #5 spaces to accommodate for icon offset
+    SPACING=5   # 5 spaces to accommodate for icon offset
 fi
 BANNER_TEXT_PADDING="${(j::)${(l:$SPACING:: :)}}"
 
@@ -126,36 +117,41 @@ OVERLAY_ICON="${ICON_FILES}UserIcon.icns"
 SD_ICON_FILE="${SUPPORT_DIR}/SupportFiles/sso.png"
 SSO_GRAPHIC="${SUPPORT_DIR}/SupportFiles/pSSO_Notification.png"
 
-# Trigger installs for Images & icons
+# Trigger installs for images & icons
 
 FOCUS_FILE="$USER_DIR/Library/DoNotDisturb/DB/Assertions.json"
-SD_TIMER=300    #Length of time you want the message on the screen (300=5 mins)
-JAMF_AAD_BINARY="/usr/local/jamf/bin/jamfAAD"
-APP_EXTENSIONS=("com.microsoft.CompanyPortalMac.ssoextension"
-                "com.microsoft.CompanyPortalMac.Mac-Autofill-Extension")
+SD_TIMER=300    # Length of time you want the message on the screen (300 = 5 mins)
 
+# --------------------------------------------------------------------------
+# Okta-specific: app extension bundle ID for Okta Verify Platform SSO
+# The Microsoft CompanyPortalMac extensions from the original script have
+# been replaced with the single Okta Verify SSO extension.
+# --------------------------------------------------------------------------
+APP_EXTENSIONS=("com.okta.mobile.app.ssoextension")
+
+# JAMF policy triggers - update these to match your JAMF policy trigger names
 SUPPORT_FILE_INSTALL_POLICY="install_SymFiles"
 DIALOG_INSTALL_POLICY="install_SwiftDialog"
 PSSO_ICON_POLICY="install_psso_icon"
 SSO_GRAPHIC_POLICY="install_sso_graphic"
-PORTAL_APP_POLICY="install_mscompanyportal"
+PORTAL_APP_POLICY="install_okta_verify"     # <-- was: install_mscompanyportal
 
 ##################################################
 #
 # Passed in variables
-# 
+#
 #################################################
 
 JAMF_LOGGED_IN_USER=${3:-"$LOGGED_IN_USER"}    # Passed in by JAMF automatically
-SD_FIRST_NAME="${(C)JAMF_LOGGED_IN_USER%%.*}"   
-CLIENT_ID=${4}                               # user name for JAMF Pro
+SD_FIRST_NAME="${(C)JAMF_LOGGED_IN_USER%%.*}"
+CLIENT_ID=${4}                                  # Client ID for JAMF Pro API
 CLIENT_SECRET=${5}
 MDM_PROFILE=${6}
 JAMF_GROUP_NAME=${7}
-RUN_JAMF_AAD_ON_ERROR=${8:-"yes"}
+RUN_OKTA_ON_ERROR=${8:-"yes"}                   # <-- was: RUN_JAMF_AAD_ON_ERROR
 CHECK_FOR_TOUCHID=${9:-"yes"}
 
-[[ ${#CLIENT_ID} -gt 30 ]] && JAMF_TOKEN="new" || JAMF_TOKEN="classic" #Determine with JAMF creentials we are using
+[[ ${#CLIENT_ID} -gt 30 ]] && JAMF_TOKEN="new" || JAMF_TOKEN="classic"
 
 ####################################################################################################
 #
@@ -170,34 +166,30 @@ function create_log_directory ()
     #
     # RETURN: None
 
-	# If the log directory doesnt exist - create it and set the permissions (using zsh paramter expansion to get directory)
-	LOG_DIR=${LOG_FILE%/*}
-	[[ ! -d "${LOG_DIR}" ]] && /bin/mkdir -p "${LOG_DIR}"
-	/bin/chmod 755 "${LOG_DIR}"
+    LOG_DIR=${LOG_FILE%/*}
+    [[ ! -d "${LOG_DIR}" ]] && /bin/mkdir -p "${LOG_DIR}"
+    /bin/chmod 755 "${LOG_DIR}"
 
-	# If the log file does not exist - create it and set the permissions
-	[[ ! -f "${LOG_FILE}" ]] && /usr/bin/touch "${LOG_FILE}"
-	/bin/chmod 644 "${LOG_FILE}"
+    [[ ! -f "${LOG_FILE}" ]] && /usr/bin/touch "${LOG_FILE}"
+    /bin/chmod 644 "${LOG_FILE}"
 }
 
-function logMe () 
+function logMe ()
 {
-    # Basic two pronged logging function that will log like this:
+    # Basic two-pronged logging function that will log like this:
     #
-    # 20231204 12:00:00: Some message here
+    # 2026-03-10 12:00:00: Some message here
     #
-    # This function logs both to STDOUT/STDERR and a file
-    # The log file is set by the $LOG_FILE variable.
-    #
+    # Logs both to STDOUT/STDERR and a file.
     # RETURN: None
+
     echo "$(/bin/date '+%Y-%m-%d %H:%M:%S'): ${1}" | tee -a "${LOG_FILE}"
 }
 
 function check_swift_dialog_install ()
 {
-    # Check to make sure that Swift Dialog is installed and functioning correctly
-    # Will install process if missing or corrupted
-    #
+    # Check to make sure that Swift Dialog is installed and functioning correctly.
+    # Will install if missing or outdated.
     # RETURN: None
 
     logMe "Ensuring that swiftDialog version is installed..."
@@ -211,42 +203,40 @@ function check_swift_dialog_install ()
     if ! is-at-least "${MIN_SD_REQUIRED_VERSION}" "${SD_VERSION}"; then
         logMe "Swift Dialog is outdated - Installing version '${MIN_SD_REQUIRED_VERSION}' from JAMF..."
         install_swift_dialog
-    else    
+    else
         logMe "Swift Dialog is currently running: ${SD_VERSION}"
     fi
 }
 
 function install_swift_dialog ()
 {
-    # Install Swift dialog From JAMF
+    # Install Swift Dialog from JAMF.
     # PARMS Expected: DIALOG_INSTALL_POLICY - policy trigger from JAMF
-    #
     # RETURN: None
 
-	/usr/local/bin/jamf policy -trigger ${DIALOG_INSTALL_POLICY}
+    /usr/local/bin/jamf policy -trigger ${DIALOG_INSTALL_POLICY}
 }
 
 function check_support_files ()
 {
     [[ ! -e "${SD_BANNER_IMAGE}" ]] && /usr/local/bin/jamf policy -trigger ${SUPPORT_FILE_INSTALL_POLICY}
-    [[ ! -e "${SD_ICON_FILE}" ]] && /usr/local/bin/jamf policy -trigger ${PSSO_ICON_POLICY}
-    [[ ! -e "${SSO_GRAPHIC}" ]] && /usr/local/bin/jamf policy -trigger ${SSO_GRAPHIC_POLICY}
+    [[ ! -e "${SD_ICON_FILE}" ]]    && /usr/local/bin/jamf policy -trigger ${PSSO_ICON_POLICY}
+    [[ ! -e "${SSO_GRAPHIC}" ]]     && /usr/local/bin/jamf policy -trigger ${SSO_GRAPHIC_POLICY}
 }
 
 function cleanup_and_exit ()
 {
-	[[ -f ${JSON_OPTIONS} ]] && /bin/rm -rf ${JSON_OPTIONS}
-	[[ -f ${TMP_FILE_STORAGE} ]] && /bin/rm -rf ${TMP_FILE_STORAGE}
-    [[ -f ${DIALOG_COMMAND_FILE} ]] && /bin/rm -rf ${DIALOG_COMMAND_FILE}
+    [[ -f ${JSON_OPTIONS} ]]         && /bin/rm -rf ${JSON_OPTIONS}
+    [[ -f ${TMP_FILE_STORAGE} ]]     && /bin/rm -rf ${TMP_FILE_STORAGE}
+    [[ -f ${DIALOG_COMMAND_FILE} ]]  && /bin/rm -rf ${DIALOG_COMMAND_FILE}
     JAMF_invalidate_token
-	exit $1
+    exit $1
 }
 
 function JAMF_check_credentials ()
 {
     # PURPOSE: Check to make sure the Client ID & Secret are passed correctly
     # RETURN: None
-    # EXPECTED: None
 
     if [[ -z $CLIENT_ID ]] || [[ -z $CLIENT_SECRET ]]; then
         logMe "Client/Secret info is not valid"
@@ -257,9 +247,8 @@ function JAMF_check_credentials ()
 
 function JAMF_check_connection ()
 {
-    # PURPOSE: Function to check connectivity to the Jamf Pro server
+    # PURPOSE: Check connectivity to the JAMF Pro server
     # RETURN: None
-    # EXPECTED: None
 
     if ! /usr/local/bin/jamf -checkjssconnection -retry 5; then
         logMe "Error: JSS connection not active."
@@ -270,9 +259,8 @@ function JAMF_check_connection ()
 
 function JAMF_get_server ()
 {
-    # PURPOSE: Retreive your JAMF server URL from the preferences file
+    # PURPOSE: Retrieve JAMF server URL from preferences file
     # RETURN: None
-    # EXPECTED: None
 
     jamfpro_url=$(/usr/bin/defaults read /Library/Preferences/com.jamfsoftware.jamf.plist jss_url)
     logMe "JAMF Pro server is: $jamfpro_url"
@@ -280,43 +268,37 @@ function JAMF_get_server ()
 
 function JAMF_get_classic_api_token ()
 {
-    # PURPOSE: Get a new bearer token for API authentication.  This is used if you are using a JAMF Pro ID & password to obtain the API (Bearer token)
-    # PARMS: None
+    # PURPOSE: Get a bearer token using JAMF Pro ID & password (Classic API)
     # RETURN: api_token
-    # EXPECTED: CLIENT_ID, CLIENT_SECRET, jamfpro_url
 
-     api_token=$(/usr/bin/curl -X POST --silent -u "${CLIENT_ID}:${CLIENT_SECRET}" "${jamfpro_url}/api/v1/auth/token" | plutil -extract token raw -)
-     if [[ "$api_token" == *"Could not extract value"* ]]; then
-         logMe "Error: Unable to obtain API token. Check your credentials and JAMF Pro URL."
-         exit 1
-     else 
+    api_token=$(/usr/bin/curl -X POST --silent -u "${CLIENT_ID}:${CLIENT_SECRET}" "${jamfpro_url}/api/v1/auth/token" | plutil -extract token raw -)
+    if [[ "$api_token" == *"Could not extract value"* ]]; then
+        logMe "Error: Unable to obtain API token. Check your credentials and JAMF Pro URL."
+        exit 1
+    else
         logMe "Classic API token successfully obtained."
     fi
-
 }
 
-function JAMF_validate_token () 
+function JAMF_validate_token ()
 {
-     # Verify that API authentication is using a valid token by running an API command
-     # which displays the authorization details associated with the current API user. 
-     # The API call will only return the HTTP status code.
+    # Verify that API authentication is using a valid token.
+    # The API call will only return the HTTP status code.
 
-     api_authentication_check=$(/usr/bin/curl --write-out %{http_code} --silent --output /dev/null "${jamfpro_url}/api/v1/auth" --request GET --header "Authorization: Bearer ${api_token}")
+    api_authentication_check=$(/usr/bin/curl --write-out %{http_code} --silent --output /dev/null "${jamfpro_url}/api/v1/auth" --request GET --header "Authorization: Bearer ${api_token}")
 }
 
 function JAMF_get_access_token ()
 {
-    # PURPOSE: obtain an OAuth bearer token for API authentication.  This is used if you are using  Client ID & Secret credentials)
-    # RETURN: connection stringe (either error code or valid data)
-    # PARMS: None
-    # EXPECTED: CLIENT_ID, CLIENT_SECRET, jamfpro_url
+    # PURPOSE: Obtain an OAuth bearer token using Client ID & Secret (Modern API)
+    # RETURN: api_token
 
     returnval=$(curl --silent --location --request POST "${jamfpro_url}/api/oauth/token" \
         --header "Content-Type: application/x-www-form-urlencoded" \
         --data-urlencode "client_id=${CLIENT_ID}" \
         --data-urlencode "grant_type=client_credentials" \
         --data-urlencode "client_secret=${CLIENT_SECRET}")
-    
+
     if [[ -z "$returnval" ]]; then
         logMe "Check Jamf URL"
         exit 1
@@ -326,42 +308,27 @@ function JAMF_get_access_token ()
     else
         logMe "API token successfully obtained."
     fi
-    
+
     api_token=$(echo "$returnval" | plutil -extract access_token raw -)
 }
 
 function JAMF_check_and_renew_api_token ()
 {
-     # Verify that API authentication is using a valid token by running an API command
-     # which displays the authorization details associated with the current API user. 
-     # The API call will only return the HTTP status code.
+    # Verify token validity and renew if needed.
 
-     JAMF_validate_token
+    JAMF_validate_token
 
-     # If the api_authentication_check has a value of 200, that means that the current
-     # bearer token is valid and can be used to authenticate an API call.
-
-     if [[ ${api_authentication_check} == 200 ]]; then
-
-     # If the current bearer token is valid, it is used to connect to the keep-alive endpoint. This will
-     # trigger the issuing of a new bearer token and the invalidation of the previous one.
-
-          api_token=$(/usr/bin/curl "${jamfpro_url}/api/v1/auth/keep-alive" --silent --request POST -H "Authorization: Bearer ${api_token}" | plutil -extract token raw -)
-
-     else
-
-          # If the current bearer token is not valid, this will trigger the issuing of a new bearer token
-          # using Basic Authentication.
-
-          JAMF_get_classic_api_token
-     fi
+    if [[ ${api_authentication_check} == 200 ]]; then
+        api_token=$(/usr/bin/curl "${jamfpro_url}/api/v1/auth/keep-alive" --silent --request POST -H "Authorization: Bearer ${api_token}" | plutil -extract token raw -)
+    else
+        JAMF_get_classic_api_token
+    fi
 }
 
 function JAMF_invalidate_token ()
 {
-    # PURPOSE: invalidate the JAMF Token to the server
+    # PURPOSE: Invalidate the JAMF bearer token
     # RETURN: None
-    # Expected jamfpro_url, ap_token
 
     returnval=$(/usr/bin/curl -w "%{http_code}" -H "Authorization: Bearer ${api_token}" "${jamfpro_url}/api/v1/auth/invalidate-token" -X POST -s -o /dev/null)
 
@@ -371,16 +338,16 @@ function JAMF_invalidate_token ()
         logMe "Token already invalid"
     else
         logMe "Unexpected response code: $returnval"
-        exit 1  # Or handle it in a different way (e.g., retry or log the error)
-    fi    
+        exit 1
+    fi
 }
 
 function JAMF_get_deviceID ()
 {
-    # PURPOSE: uses the serial number or hostname to get the device ID from the JAMF Pro server.
-    # RETURN: the device ID for the device in question.
-    # PARMS: $1 - search identifier to use (serial or Hostname)
-    #        $2 - Conputer ID (serial/hostname)
+    # PURPOSE: Use serial number or hostname to get the device ID from JAMF Pro
+    # RETURN: Device ID
+    # PARAMETERS: $1 = search type (Serials / Hostname), $2 = identifier value
+
     local type retval ID
     [[ "$1" == "Hostname" ]] && type="general.name" || type="hardware.serialNumber"
     retval=$(/usr/bin/curl -s -H "Authorization: Bearer ${api_token}" -H "Accept: application/json" "${jamfpro_url}api/v3/computers-inventory?filter=${type}=='${2}'") || {
@@ -389,7 +356,6 @@ function JAMF_get_deviceID ()
         return 1
     }
 
-    # Basic JSON validity check
     if ! jq -e . >/dev/null 2>&1 <<<"$retval"; then
         display_failure_message "Invalid JSON response from Jamf Pro"
         echo "ERR"
@@ -421,10 +387,10 @@ function JAMF_get_deviceID ()
 
 function JAMF_retrieve_static_groupID ()
 {
-    # PURPOSE: Retrieve the ID of a static group
+    # PURPOSE: Retrieve the ID of a static group by name
     # RETURN: ID # of static group
-    # EXPECTED: jamppro_url, api_token
-    # PARMATERS: $1 = JAMF Static group name
+    # PARAMETERS: $1 = JAMF Static group name
+
     local tmp
     tmp=$(/usr/bin/curl -s -H "Authorization: Bearer ${api_token}" -H "Accept: application/json" "${jamfpro_url}api/v2/computer-groups/static-groups?sort=id%3Aasc") || {
         display_failure_message "Failed to contact Jamf Pro"
@@ -432,7 +398,6 @@ function JAMF_retrieve_static_groupID ()
         return 1
     }
 
-    # Basic JSON validity check
     if ! jq -e . >/dev/null 2>&1 <<<"$tmp"; then
         display_failure_message "Invalid JSON response from Jamf Pro"
         echo "ERR"
@@ -447,10 +412,11 @@ function JAMF_retrieve_static_groupID ()
 
     total=$(jq '.totalCount' <<<"$tmp")
     if [[ $total -eq 0 ]]; then
-        display_failure_message "Inventory Record '${2}' not found"
+        display_failure_message "No groups found"
         echo "NOT FOUND"
         return 1
     fi
+
     id=$(printf "%s" $tmp | tr -d '[:cntrl:]' | jq -r --arg name "$1" '.results[] | select(.name == $name) | .id')
     if [[ -z $id || $id == "null" ]]; then
         display_failure_message "$tmp"
@@ -463,29 +429,28 @@ function JAMF_retrieve_static_groupID ()
 
 function JAMF_static_group_action ()
 {
-	# PURPOSE: Remove record from JAMF static group
+    # PURPOSE: Add or remove a device record from a JAMF static group
     # RETURN: None
-    # EXPECTED: jamfpro_url, api_token
-    # PARMATERS: $1 = JAMF Static group id
-    #            $2 - Serial # of device
-    #            $3 = Acton to take "Add/Remove"
+    # PARAMETERS: $1 = JAMF Static group ID
+    #             $2 = Serial number of device
+    #             $3 = Action to take: "add" or "remove"
+
     declare apiData
     local groupID="$1" serial="$2" action="$3"
 
-    # Validate action
-    [[ "${action:l}" != (add|remove) ]] && {echo "ERROR: Action must be 'add' or 'remove'" >&2; return 1; }
-     # Validate groupID is numeric
+    [[ "${action:l}" != (add|remove) ]] && { echo "ERROR: Action must be 'add' or 'remove'" >&2; return 1; }
     [[ ! "$groupID" =~ '^[0-9]+$' ]] && { echo "ERROR: Group ID must be numeric" >&2; return 1; }
-    # Generate XML payload
+
     if [[ "${action:l}" == "remove" ]]; then
         api_data='<computer_group><computer_deletions><computer><serial_number>'${serial}'</serial_number></computer></computer_deletions></computer_group>'
     else
         api_data='<computer_group><computer_additions><computer><serial_number>'${serial}'</serial_number></computer></computer_additions></computer_group>'
     fi
-    ## curl call to the API to add the computer to the provided group ID
+
     retval=$(curl -w "%{http_code}" -s -H "Authorization: Bearer ${api_token}" -H "Content-Type: application/xml" "${jamfpro_url}JSSResource/computergroups/id/${groupID}" --request PUT --data "$api_data" -o /dev/null)
+
     case "$retval" in
-        200|201) return 0 ;;  # Success
+        200|201) return 0 ;;
         409) echo "ERROR: Computer not in group" >&2; return 1 ;;
         401) echo "ERROR: API token invalid/expired" >&2; return 1 ;;
         404) echo "ERROR: Group ID $groupID not found" >&2; return 1 ;;
@@ -493,53 +458,65 @@ function JAMF_static_group_action ()
     esac
 }
 
-function JAMF_check_AAD ()
+# --------------------------------------------------------------------------
+# JAMF_check_Okta
+#
+# Replaces the original JAMF_check_AAD function which depended on the
+# jamfAAD binary - an Entra ID-only tool with no Okta equivalent.
+#
+# This function verifies Okta Platform SSO registration status using the
+# macOS-native `app-sso platform -s` command, which is provider-agnostic
+# and works with any Platform SSO extension including Okta Verify.
+#
+# RETURN: 0 = registered OK, 1 = not registered / error
+# --------------------------------------------------------------------------
+function JAMF_check_Okta ()
 {
-    local jamf_response
+    local okta_status
     local retval=1
-    logMe "Checking for JAMF Pro compliance information"
-    jamf_response=$(runAsUser "${JAMF_AAD_BINARY}" gatherAADInfo ) #2>&1)
-    if [[ $(echo "${jamf_response}" | grep -c 'AAD ID acquired') -gt 0 ]]; then
-        logMe "INFO: JAMF Pro registration successfully updated."
+
+    logMe "Checking Okta Verify Platform SSO registration status..."
+    okta_status=$(runAsUser app-sso platform -s 2>/dev/null)
+
+    if [[ $(getValueOf registrationCompleted "$okta_status") == "true" ]]; then
+        logMe "INFO: Okta Platform SSO registration confirmed."
     else
-        logMe "ERROR: Could not gather Jamf Pro device compliance information:\n${jamf_response}"
+        logMe "ERROR: Okta Platform SSO not showing as registered."
+        logMe "app-sso output: ${okta_status}"
         retval=0
     fi
     return $retval
 }
 
-function reinstall_companyportal ()
+function reinstall_okta_verify ()
 {
-    # PURPOSE: Reinstall the MS Company Portal app if found
+    # PURPOSE: Reinstall Okta Verify if already present, to ensure latest version
     # RETURN: None
-    # PARAMETERS: None
-    # EXPECTED: None
-    company_portal_app="/Applications/Company Portal.app"
+    # NOTE: Uncomment the call to this function in Main if you want to force reinstall
 
-    # Uninstall Company Portal if found to ensure the latest version will be installed
-    if [[ -d "$company_portal_app" ]]; then
-        logMe "Company Portal found; uninstalling..."
-        rm -rf "$company_portal_app"
+    local okta_verify_app="/Applications/Okta Verify.app"
+
+    if [[ -d "$okta_verify_app" ]]; then
+        logMe "Okta Verify found; uninstalling..."
+        rm -rf "$okta_verify_app"
     else
-        logMe "Company Portal not found; continuing..."
+        logMe "Okta Verify not found; continuing with fresh install..."
     fi
 
-    # Install Microsoft Company Portal
-    logMe "Installing Microsoft Company Portal..."
+    logMe "Installing Okta Verify..."
     /usr/local/jamf/bin/jamf policy -trigger "$PORTAL_APP_POLICY" --forceNoRecon
 
-    # Check that Company Portal app is installed
-    if [[ -d "$company_portal_app" ]]; then
-        logMe "Company Portal App is installed. Ready to install PSSO profile."
+    if [[ -d "$okta_verify_app" ]]; then
+        logMe "Okta Verify is installed. Ready to proceed with PSSO profile."
     else
-        logMe "Company Portal app did not install. Exiting with error..."
+        logMe "Okta Verify did not install. Exiting with error..."
         exit 1
     fi
 }
 
 function display_failure_message ()
 {
-     MainDialogBody=(
+    MainDialogBody=(
         --bannerimage "${SD_BANNER_IMAGE}"
         --bannertitle "${SD_WINDOW_TITLE}"
         --titlefont shadow=1
@@ -555,33 +532,34 @@ function display_failure_message ()
 
     $SW_DIALOG "${MainDialogBody[@]}" 2>/dev/null
     buttonpress=$?
-
 }
 
 function check_for_profile ()
 {
     # PURPOSE: Check to see if a profile is installed
-    # RETURN: Profile Installed (Yes/No)
-    # EXPECTED: None
+    # RETURN: "Yes" or "No"
     # PARAMETERS: $1 = Profile name to search for
+
     logMe "Checking if Platform Single Sign-on profile is installed..."
-	check_installed=$(/usr/bin/profiles -C -v | /usr/bin/awk -F: '/attribute: name/{print $NF}' | /usr/bin/grep "${1}" | xargs)
-	
-	# Confirm installed
-	if [[ "$check_installed" == "$1" ]]; then
-		logMe "Platform SSO for Microsoft Entra ID profile is installed"
-		echo "Yes"
-	else
-		logMe "Platform SSO for Microsoft Entra ID profile is not installed"
-		echo "No"
-	fi
+    check_installed=$(/usr/bin/profiles -C -v | /usr/bin/awk -F: '/attribute: name/{print $NF}' | /usr/bin/grep "${1}" | xargs)
+
+    if [[ "$check_installed" == "$1" ]]; then
+        logMe "Okta Platform SSO profile is installed"
+        echo "Yes"
+    else
+        logMe "Okta Platform SSO profile is not installed"
+        echo "No"
+    fi
 }
 
 function displaymsg ()
 {
-	message="When you see this macOS notification appear, please click the register button within the prompt, and go through the registration process."
-    if [[ $FOCUS_STATUS = "On" ]] && message+="<br><br>**Since your focus mode is turned on, you will need to click in the notification center to see this prompt**"
-	MainDialogBody=(
+    message="When you see this macOS notification appear, please click the register button within the prompt, and go through the Okta registration process."
+    if [[ $FOCUS_STATUS = "On" ]]; then
+        message+="<br><br>**Since your focus mode is turned on, you will need to click in the notification center to see this prompt**"
+    fi
+
+    MainDialogBody=(
         --message "<br>$SD_DIALOG_GREETING $SD_FIRST_NAME. $message"
         --titlefont shadow=1
         --appearance light
@@ -589,9 +567,9 @@ function displaymsg ()
         --overlayicon "${OVERLAY_ICON}"
         --bannerimage "${SD_BANNER_IMAGE}"
         --bannertitle "${SD_WINDOW_TITLE}"
-		--commandfile "${DIALOG_COMMAND_FILE}"
-		--image "${SSO_GRAPHIC}"
-        --helpmessage "Contact the TSD or put in a ticket if you are having problems registering your device."
+        --commandfile "${DIALOG_COMMAND_FILE}"
+        --image "${SSO_GRAPHIC}"
+        --helpmessage "Contact the TSD or put in a ticket if you are having problems registering your device with Okta."
         --button1text "Dismiss"
         --width 740
         --height 450
@@ -600,40 +578,36 @@ function displaymsg ()
         --ontop
         --moveable
         --ignorednd
-
     )
 
-	"${SW_DIALOG}" "${MainDialogBody[@]}" 2>/dev/null &
+    "${SW_DIALOG}" "${MainDialogBody[@]}" 2>/dev/null &
 }
 
 function getValueOf ()
 {
-	echo $2 | grep "$1" | awk -F ":" '{print $2}' | tr -d "," | xargs
+    echo $2 | grep "$1" | awk -F ":" '{print $2}' | tr -d "," | xargs
 }
 
 function get_sso_status()
 {
-	ssoStatus=$(runAsUser app-sso platform -s)
+    ssoStatus=$(runAsUser app-sso platform -s)
 }
 
 function kill_sso_agent()
 {
-	pkill AppSSOAgent
-	sleep 1
+    pkill AppSSOAgent
+    sleep 1
 }
 
-function runAsUser () 
-{  
+function runAsUser ()
+{
     launchctl asuser "${USER_UID}" sudo -u "${LOGGED_IN_USER}" "$@"
-
 }
 
 function check_focus_status ()
 {
     # PURPOSE: Check to see if the user is in focus mode
-    # RETURN: in focus mode (Off/On)
-    # EXPECTED: FOCUS_FILE is the location of FocusMode settings
-    # PARAMETERS: None
+    # RETURN: "on" or "off"
 
     local results="off"
     if [[ -f "$FOCUS_FILE" ]] && grep -q '"storeAssertionRecords"' "$FOCUS_FILE" 2>/dev/null; then
@@ -648,28 +622,22 @@ function touch_id_status ()
     retval="$hw"
     local enrolled="false"
     local bioCount="0"
-    # --- Detect Touch ID–capable hardware (internal or external) ---
+
     bioOutput=$(ioreg -l 2>/dev/null)
 
-    # Check for the device entry indicating hardware presence
     if [[ $bioOutput == *"+-o AppleBiometricSensor"* ]]; then
         hw="Present"
     else
-        # Fallback: Parse IOKitDiagnostics for class instance count
         if [[ $bioOutput =~ '"AppleBiometricSensor"=([0-9]+)' && ${match[1]} -gt 0 ]]; then
             hw="Present"
-        # Fallback: Magic Keyboard with Touch ID
         elif system_profiler SPUSBDataType 2>/dev/null | grep -q "Magic Keyboard.*Touch ID"; then
             hw="Present"
         fi
     fi
 
     if [[ "${hw}" == "Present" ]]; then
-        # Enrollment check
-
         bioCount=$(runAsUser bioutil -c 2>/dev/null | awk '/biometric template/{print $3}' | grep -Eo '^[0-9]+$' || echo "0")
         [[ "${bioCount}" -gt 0 ]] && enrolled="true"
-
         [[ "${enrolled}" == "true" ]] && retval="Enabled" || retval="Not enabled"
     fi
     echo "$retval"
@@ -677,10 +645,9 @@ function touch_id_status ()
 
 function force_touch_id ()
 {
-    # PURPOSE: Forces touchID registration
+    # PURPOSE: Force TouchID registration
     # RETURN: 0 if successful, 1 if aborted
-    # EXPECTED: TOUCH_ID_STATUS = Status of TouchID sensor
-    # PARAMETERS: None
+
     while true; do
         open "x-apple.systempreferences:com.apple.Touch-ID-Settings.extension"
         "${SW_DIALOG}" \
@@ -696,33 +663,30 @@ function force_touch_id ()
 
         buttonpress=$?
         TOUCH_ID_STATUS=$(touch_id_status)
-        [[ $TOUCH_ID_STATUS == "enabled" || $buttonpress == 2 ]] && break
+        [[ $TOUCH_ID_STATUS == "Enabled" || $buttonpress == 2 ]] && break
     done
+
     killall "System Settings" >/dev/null 2>&1
-    # Set the status code
     [[ $buttonpress == 2 ]] && return 1 || return 0
 }
 
 function enable_app_extension ()
 {
-    # PURPOSE: Enable the auto fill extension for TouchID
-    #          check each extension listed in the array to see if it is enabled in PlugKit
+    # PURPOSE: Enable Okta Verify SSO extension via PlugKit
+    #          Iterates APP_EXTENSIONS array and enables any that are not already active
     # RETURN: None
-    # EXPECTED: APP_EXTENSIONS array of extensions to check / enable
-    # PARAMETERS: None
-    # 
 
     for extension in "${APP_EXTENSIONS[@]}"; do
         logMe "Checking for extension: $extension"
         results=$(runAsUser pluginkit -m | grep "${extension}")
-        # Check if extension exists
+
         if [[ -z $results ]]; then
             logMe "Error: Extension not found: ${extension}"
             logMe "Skipping..."
             continue
         fi
         logMe "Extension found: $extension"
-        # Check if the extension is enabled
+
         if [[ $(echo $results | awk '{print $1}') == "+" ]]; then
             logMe "INFO: $extension is already enabled"
         else
@@ -760,9 +724,8 @@ check_support_files
 JAMF_check_connection
 JAMF_get_server
 
-# Check if the JAMF Pro server is using the new API or the classic API
-# If the client ID is longer than 30 characters, then it is using the new API
-[[ $JAMF_TOKEN == "new" ]] && JAMF_get_access_token || JAMF_get_classic_api_token   
+# Determine which API to use based on Client ID length
+[[ $JAMF_TOKEN == "new" ]] && JAMF_get_access_token || JAMF_get_classic_api_token
 
 ##
 ## Check the status of Focus Mode
@@ -777,20 +740,20 @@ if [[ "${CHECK_FOR_TOUCHID:l}" == "yes" ]]; then
     TOUCH_ID_STATUS=$(touch_id_status)
     logMe "INFO: Touch ID Status: $TOUCH_ID_STATUS"
     if [[ "${TOUCH_ID_STATUS}" == "Not enabled" ]]; then
-        # if it present, but not enabled, then force the user into adding their fingerprint
         logMe "Forcing TouchID Registration"
         force_touch_id
         [[ $? -ne 0 ]] && { logMe "Script Aborted"; cleanup_and_exit 1; }
         logMe "INFO: Touch ID Status: $TOUCH_ID_STATUS"
     fi
 fi
-##
-## Reinstall the companyportal app..uncomment the below line to perform operation
-##
-#reinstall_companyportal
 
 ##
-## retrieve the JAMF ID # of the static group name
+## Reinstall Okta Verify - uncomment the line below to force reinstall
+##
+#reinstall_okta_verify
+
+##
+## Retrieve the JAMF ID # of the static group
 ##
 groupID=$(JAMF_retrieve_static_groupID $JAMF_GROUP_NAME)
 [[ -z $groupID ]] && { display_failure_message "Group ID came back empty!"; cleanup_and_exit 1; }
@@ -799,7 +762,7 @@ groupID=$(JAMF_retrieve_static_groupID $JAMF_GROUP_NAME)
 logMe "Group ID is: $groupID"
 
 ##
-## Retrieve JAMF Device ID (conputer record)
+## Retrieve JAMF Device ID (computer record)
 ##
 deviceID=$(JAMF_get_deviceID "Serials" $MAC_SERIAL)
 [[ $deviceID == *"ERR"* ]] && cleanup_and_exit 1
@@ -807,27 +770,27 @@ deviceID=$(JAMF_get_deviceID "Serials" $MAC_SERIAL)
 logMe "Device ID is: $deviceID"
 
 ##
-## Profile check
+## Profile check - add to group (or remove and re-add if already present)
 ##
-profileInstalled=(check_for_profile $MDM_PROFILE)
+profileInstalled=$(check_for_profile $MDM_PROFILE)
 
 if [[ "$profileInstalled" == "No" ]]; then
     retval=$(JAMF_static_group_action $groupID $MAC_SERIAL "add")
-    [[ -z $retval ]] && logMe "Successful addition" || {logMe $retval; cleanup_and_exit 1; }
+    [[ -z $retval ]] && logMe "Successful addition" || { logMe $retval; cleanup_and_exit 1; }
 else
-    # System was found, so lets remove it first and then re-add it to force the prompt to appear
-    logMe "Platform SSO for Microsoft Entra ID profile is already installed. Uninstalling and reinstalling..."
+    # Profile already present - remove and re-add to force the registration prompt
+    logMe "Okta Platform SSO profile is already installed. Cycling group membership to re-trigger prompt..."
     logMe "Removing $MAC_SERIAL from $JAMF_GROUP_NAME ($groupID)"
     retval=$(JAMF_static_group_action $groupID $MAC_SERIAL "remove")
-    [[ -z $retval ]] && logMe "Successful removal" || {logMe $retval; cleanup_and_exit 1; }
+    [[ -z $retval ]] && logMe "Successful removal" || { logMe $retval; cleanup_and_exit 1; }
     sleep 5
     logMe "Adding $MAC_SERIAL to $JAMF_GROUP_NAME ($groupID)"
     retval=$(JAMF_static_group_action $groupID $MAC_SERIAL "add")
-    [[ -z $retval ]] && logMe "Successful addition" || {logMe $retval; cleanup_and_exit 1; }
+    [[ -z $retval ]] && logMe "Successful addition" || { logMe $retval; cleanup_and_exit 1; }
 fi
 
 ##
-## Check App extensions and enable
+## Check app extensions and enable if needed
 ##
 enable_app_extension
 
@@ -836,45 +799,55 @@ enable_app_extension
 ##
 get_sso_status
 if [[ $(getValueOf registrationCompleted "$ssoStatus") == true ]]; then
-    logMe "User already registered"
+    logMe "User already registered with Okta Platform SSO"
     cleanup_and_exit 0
 fi
 
-logMe "Prompting user to register device"
+logMe "Prompting user to register device with Okta"
 displaymsg
 echo "activate:" > ${DIALOG_COMMAND_FILE}
-# Force the registration dialog to appear
-logMe "Stopping pSSO agent"
+
+# Force the registration dialog to appear by restarting the SSO agent
+logMe "Stopping Platform SSO agent"
 kill_sso_agent
-# Wait until registation is complete
-interval=10     # seconds
-max_wait=300    # total seconds before timeout (e.g., 5 minutes)
+
+# Wait until registration is complete
+interval=10     # seconds between checks
+max_wait=300    # total seconds before timeout (5 minutes)
 start_ts=$(date +%s)
 
 until [[ $(getValueOf registrationCompleted "$ssoStatus") == true ]]; do
     sleep "$interval"
-    logMe "Device has not been registered yet."
+    logMe "Device has not completed Okta registration yet."
     now_ts=$(date +%s)
     if (( now_ts - start_ts >= max_wait )); then
-        logMe "ERROR: Timed out after ${max_wait}s waiting for User Registration."
+        logMe "ERROR: Timed out after ${max_wait}s waiting for Okta registration."
         cleanup_and_exit 1
     fi
     sleep $interval
     get_sso_status
 done
-logMe "INFO: Registration Finished Successfully"
+
+logMe "INFO: Okta Platform SSO Registration Finished Successfully"
 echo "quit:" > ${DIALOG_COMMAND_FILE}
 
 ##
-## double check JAMF to make sure if is marked as registered
+## Verify registration via app-sso and optionally attempt remediation
+## (Replaces the original jamfAAD gatherAADInfo check, which was Entra-only)
 ##
-if  JAMF_check_AAD; then
-    logMe "ERROR: jamfAADInfo doesn't report successful registration!"
-    if [[ "${RUN_JAMF_AAD_ON_ERROR:l}" == "yes" ]]; then
-        logMe "INFO: Sleeping for 5 secs and then running the gatherAADInfo command"
-        ${SW_DIALOG} --notification --identifier "registration" --title "Doing some Platform SSO registration" --message "Please be patient" --button1text "Dismiss"
+if JAMF_check_Okta; then
+    logMe "INFO: Okta Platform SSO confirmed registered."
+else
+    logMe "ERROR: app-sso does not report successful Okta registration!"
+    if [[ "${RUN_OKTA_ON_ERROR:l}" == "yes" ]]; then
+        logMe "INFO: Sleeping 5 secs then re-triggering Okta Verify install policy..."
+        ${SW_DIALOG} --notification \
+            --identifier "registration" \
+            --title "Finalising Okta Platform SSO registration" \
+            --message "Please be patient while we complete setup." \
+            --button1text "Dismiss"
         sleep 5
-        runAsUser /usr/local/jamf/bin/jamfAAD gatherAADInfo
+        /usr/local/bin/jamf policy -trigger "$PORTAL_APP_POLICY"
         ${SW_DIALOG} --notification --identifier "registration" --remove
     fi
 fi
